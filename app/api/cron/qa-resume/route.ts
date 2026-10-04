@@ -6,6 +6,7 @@ import { getAppConfig } from '@/lib/config';
 import { buildIntuneAppDescription } from '@/lib/intune-description';
 import { extractSilentSwitches } from '@/lib/msp/silent-switches';
 import { triggerPackagingWorkflow, type WorkflowInputs } from '@/lib/github-actions';
+import { assertCuratedLicenceAccepted, CuratedLicenceError } from '@/lib/curated-catalog/licence';
 import { handleAutoUpdateJobCompletion } from '@/lib/auto-update/cleanup';
 import { ensureQaDemand } from '@/lib/qa/demand';
 import { isDeferredCustomerQaEnabled } from '@/lib/qa/continuity';
@@ -190,6 +191,37 @@ export async function GET(request: Request) {
       }
     }
 
+    if (features.localPackager) {
+      // The local packager can claim queued jobs straight from the database,
+      // so the licence must be checked before the job is released to it.
+      try {
+        await assertCuratedLicenceAccepted(job.tenant_id, job.winget_id);
+      } catch (error) {
+        if (!(error instanceof CuratedLicenceError)) {
+          waiting++;
+          continue;
+        }
+        const { data: failedJob } = await supabase
+          .from('packaging_jobs')
+          .update({
+            status: 'failed',
+            status_message: 'The tenant has not accepted the publisher licence agreement for this application',
+            error_code: error.code,
+            error_stage: 'validation',
+            error_category: 'validation',
+            error_message: error.message,
+            completed_at: new Date().toISOString(),
+          })
+          .eq('id', job.id)
+          .eq('status', 'awaiting_qa')
+          .select('id')
+          .maybeSingle();
+        if (failedJob) await handleAutoUpdateJobCompletion(job.id, 'failed', error.message);
+        failed++;
+        continue;
+      }
+    }
+
     const now = new Date().toISOString();
     const nextStatus = features.localPackager ? 'queued' : 'packaging';
     const { data: claimed, error: claimError } = await supabase
@@ -266,16 +298,19 @@ export async function GET(request: Request) {
         .eq('status', 'packaging');
       resumed++;
     } catch (error) {
+      const licenceRequired = error instanceof CuratedLicenceError;
       const { data: failedJob } = await supabase
         .from('packaging_jobs')
         .update({
           status: 'failed',
-          status_message: qaDeferred
+          status_message: licenceRequired
+            ? 'The tenant has not accepted the publisher licence agreement for this application'
+            : qaDeferred
             ? 'Packaging could not start during the continuity window'
             : 'Installation test passed, but packaging could not start automatically',
-          error_code: 'QA_RESUME_DISPATCH_FAILED',
-          error_stage: 'authenticate',
-          error_category: 'network',
+          error_code: licenceRequired ? error.code : 'QA_RESUME_DISPATCH_FAILED',
+          error_stage: licenceRequired ? 'validation' : 'authenticate',
+          error_category: licenceRequired ? 'validation' : 'network',
           error_message: error instanceof Error ? error.message : 'Unknown resume error',
           completed_at: new Date().toISOString(),
         })
