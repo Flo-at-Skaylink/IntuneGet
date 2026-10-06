@@ -53,6 +53,22 @@ minutes doubling to 24 hours. It survives a packager/profile change and records
 an attempt once. Successful verification clears that cooldown. Hash mismatch
 and other deterministic integrity failures retain their existing quarantine.
 
+## Host verification after an interrupted VM test
+
+The repair agent runs without Hyper-V rights and must never be given them. A
+completed VM job already proves the VM restored cleanly, so a stall in
+publication, reconciliation or dispatch needs no host check. Only when a VM test
+was interrupted before its guest result (the VM job failed, was cancelled or
+timed out mid-test) does the host owner run `Verify-HyperVHostState.ps1` once in
+an elevated PowerShell. The script is read-only (`Get-Service`, `Get-Volume`,
+`Get-VM`, `Get-VMSnapshot`, `Get-VMHardDiskDrive`, `Test-VHD`), records every
+collection failure in `errors`, and writes `hyperv-verification-<utc>.json` next
+to itself. The guardian accepts that file only when it is newer than the pause,
+`errors` is empty, the VM is off on the `Golden-Clean` checkpoint, at least one
+disk is listed and every disk passes `Test-VHD`, and the volume marked `system`
+has at least 50 GB free. The agent then performs its normal guarded resume and
+strict retests.
+
 ## Cohort policy, version 2
 
 `/api/qa/cohort`, protected by `CRON_SECRET`, is the authoritative audit used by
