@@ -6,7 +6,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createServerClient } from '@/lib/supabase';
 import { getDatabase } from '@/lib/db';
-import { cancelWorkflowRun, isGitHubActionsConfigured } from '@/lib/github-actions';
+import {
+  cancelWorkflowRun,
+  getWorkflowRun,
+  isGitHubActionsConfigured,
+  UNSTARTED_WORKFLOW_RUN_STATUSES,
+} from '@/lib/github-actions';
 import { parseAccessToken } from '@/lib/auth-utils';
 import { handleAutoUpdateJobCompletion } from '@/lib/auto-update/cleanup';
 import type { Database } from '@/types/database';
@@ -143,7 +148,21 @@ export async function POST(request: NextRequest) {
       }
 
       githubCancelResult = await cancelWorkflowRun(typedJob.github_run_id);
-      if (!githubCancelResult.success) {
+      if (!githubCancelResult.success && githubCancelResult.status === 'not_cancellable') {
+        // GitHub can report a run as queued while rejecting both cancel and
+        // force-cancel because it never really queued it. Nothing has run, so
+        // the job is released locally. The workflow stops on its first
+        // callback if GitHub ever starts the run.
+        const run = await getWorkflowRun(Number(typedJob.github_run_id)).catch(() => null);
+        if (run && UNSTARTED_WORKFLOW_RUN_STATUSES.includes(run.status)) {
+          githubCancelResult = {
+            success: false,
+            status: 'not_started',
+            message: 'GitHub never started this workflow run',
+          };
+        }
+      }
+      if (!githubCancelResult.success && githubCancelResult.status !== 'not_started') {
         const status = githubCancelResult.status === 'error' ? 502 : 409;
         return NextResponse.json(
           {
@@ -195,7 +214,7 @@ export async function POST(request: NextRequest) {
       updateQuery = updateQuery.not('status', 'in', '("cancelled","deployed")');
     }
 
-    let { error: updateError } = await updateQuery;
+    let { data: updatedRows, error: updateError } = await updateQuery.select('id');
 
     // If full update fails (e.g., missing columns), try minimal update
     if (updateError) {
@@ -217,7 +236,7 @@ export async function POST(request: NextRequest) {
         minimalQuery = minimalQuery.not('status', 'in', '("cancelled","deployed")');
       }
 
-      const { error: minimalError } = await minimalQuery;
+      const { data: minimalRows, error: minimalError } = await minimalQuery.select('id');
 
       if (minimalError) {
         return NextResponse.json(
@@ -228,6 +247,16 @@ export async function POST(request: NextRequest) {
 
       // Minimal update succeeded
       updateError = null;
+      updatedRows = minimalRows;
+    }
+
+    // The status lock matched nothing: the job moved on (for example, its
+    // run started) between the read and this update.
+    if (!updatedRows || updatedRows.length === 0) {
+      return NextResponse.json(
+        { error: 'The job changed status while cancelling. Refresh and try again.', retryable: true },
+        { status: 409 }
+      );
     }
 
     // Clean up auto-update tracking
